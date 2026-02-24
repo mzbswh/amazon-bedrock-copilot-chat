@@ -16,8 +16,6 @@ import {
   ConverseStreamCommand,
   type ConverseStreamCommandInput,
   type ConverseStreamOutput,
-  CountTokensCommand,
-  type CountTokensCommandInput,
   AccessDeniedException as RuntimeAccessDeniedException,
   ThrottlingException,
   ValidationException,
@@ -57,64 +55,6 @@ export class BedrockAPIClient {
     this.profileName = profileName;
     this.bedrockClient = new BedrockClient(this.getClientConfig());
     this.bedrockRuntimeClient = new BedrockRuntimeClient(this.getClientConfig());
-  }
-
-  /**
-   * Count tokens using the Bedrock CountTokens API.
-   *
-   * Note: CountTokens API does not support cross-region inference profile IDs.
-   * For inference profiles, this method resolves the base model ID using GetInferenceProfile API.
-   *
-   * @param modelId The model ID or cross-region inference profile ID
-   * @param input The input to count tokens for (Converse format)
-   * @param abortSignal Optional AbortSignal to cancel the request
-   * @returns The number of input tokens, or undefined if the API is not supported
-   */
-  async countTokens(
-    modelId: string,
-    input: CountTokensCommandInput["input"],
-    abortSignal?: AbortSignal,
-  ): Promise<number | undefined> {
-    try {
-      // Resolve the base model ID (uses GetInferenceProfile API for cross-region profiles)
-      const baseModelId = await this.resolveModelId(modelId, abortSignal);
-
-      const command = new CountTokensCommand({
-        input,
-        modelId: baseModelId,
-      });
-      const response = await this.bedrockRuntimeClient.send(command, { abortSignal });
-
-      if (baseModelId !== modelId) {
-        logger.trace(
-          `[Bedrock API Client] CountTokens used base model ID ${baseModelId} for inference profile ${modelId}`,
-        );
-      }
-
-      return response.inputTokens;
-    } catch (error) {
-      // Log detailed error information at trace level for debugging
-      logger.trace(`[Bedrock API Client] CountTokens failed for model ${modelId}`, {
-        error:
-          error instanceof Error
-            ? {
-                message: error.message,
-                name: error.name,
-                stack: error.stack,
-              }
-            : error,
-        modelId,
-      });
-
-      // If the CountTokens API is not supported for this model/region, return undefined
-      // The caller should fall back to estimation
-      logger.debug(
-        `[Bedrock API Client] CountTokens not available for model ${modelId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      return undefined;
-    }
   }
 
   /**
@@ -359,61 +299,57 @@ export class BedrockAPIClient {
       return cached;
     }
 
-    // Check if this looks like an inference profile
     // Patterns:
-    // - Regional/Global: starts with 2-3 letter region code or "global" (us.*, eu.*, global.*)
+    // - Regional/Global dot-prefix: starts with 2-3 letter region code or "global" (us.*, eu.*, global.*)
     // - Application: starts with "ip-" (ip-...)
     // - ARN: full ARN format (arn:aws:bedrock:region:account:inference-profile/... or application-inference-profile/...)
     const dotProfilePattern = /^(global|[a-z]{2,3})\./;
     const arnProfilePattern =
       /^arn:aws(-[a-z0-9]+)?:bedrock:[a-z0-9-]+:\d{12}:(application-)?inference-profile\//;
     const appProfileIdPattern = /^ip-[a-z0-9]+/i;
-    const looksLikeProfile =
-      dotProfilePattern.test(modelId) ||
-      arnProfilePattern.test(modelId) ||
-      appProfileIdPattern.test(modelId);
+
+    // For known dot-prefix formats (global.*, us.*, eu.*, etc.), derive locally — no API call needed.
+    // e.g. "global.anthropic.claude-opus-4-6-v1" → "anthropic.claude-opus-4-6-v1"
+    //      "us.anthropic.claude-opus-4-6-v1"     → "anthropic.claude-opus-4-6-v1"
+    if (dotProfilePattern.test(modelId)) {
+      const parts = modelId.split(".");
+      const derivedBaseModelId = parts.length > 2 ? parts.slice(1).join(".") : modelId;
+
+      this.inferenceProfileCache.set(modelId, derivedBaseModelId);
+      logger.trace(
+        `[Bedrock API Client] Derived base model ID from profile format ${modelId}: ${derivedBaseModelId}`,
+      );
+      return derivedBaseModelId;
+    }
+
+    // For ARN or application profile IDs, use API to resolve
+    const looksLikeProfile = arnProfilePattern.test(modelId) || appProfileIdPattern.test(modelId);
     if (!looksLikeProfile) {
       // Not an inference profile, return as-is
       return modelId;
     }
 
     try {
-      // Try to get the inference profile to resolve the base model ID
       const command = new GetInferenceProfileCommand({
         inferenceProfileIdentifier: modelId,
       });
 
       const response = await this.bedrockClient.send(command, { abortSignal });
-
-      // Extract the model ID from the models array
-      // According to AWS docs, inference profiles can contain multiple models, but we take the first one
       const baseModelId = response.models?.[0]?.modelArn?.split("/").pop() ?? modelId;
 
-      // Cache the result
       this.inferenceProfileCache.set(modelId, baseModelId);
-
       logger.trace(
         `[Bedrock API Client] Resolved inference profile ${modelId} to model ID: ${baseModelId}`,
       );
 
       return baseModelId;
     } catch (error) {
-      // If GetInferenceProfile fails (e.g. missing bedrock:GetInferenceProfile permission),
-      // derive the base model ID from the profile ID format instead of making an API call.
-      // e.g. "global.anthropic.claude-opus-4-6-v1" → "anthropic.claude-opus-4-6-v1"
-      //      "us.anthropic.claude-opus-4-6-v1"     → "anthropic.claude-opus-4-6-v1"
-      const parts = modelId.split(".");
-      const derivedBaseModelId =
-        parts.length > 2 && (parts[0].length <= 3 || parts[0] === "global")
-          ? parts.slice(1).join(".")
-          : modelId;
-
       logger.trace(
-        `[Bedrock API Client] GetInferenceProfile failed for ${modelId}, derived base model ID: ${derivedBaseModelId}`,
+        `[Bedrock API Client] GetInferenceProfile failed for ${modelId}, using as-is`,
         error,
       );
-      this.inferenceProfileCache.set(modelId, derivedBaseModelId);
-      return derivedBaseModelId;
+      this.inferenceProfileCache.set(modelId, modelId);
+      return modelId;
     }
   }
 
@@ -727,9 +663,8 @@ export class BedrockAPIClient {
   private recreateClients(): void {
     this.bedrockClient = new BedrockClient(this.getClientConfig());
     this.bedrockRuntimeClient = new BedrockRuntimeClient(this.getClientConfig());
-
-    // Clear inference profile cache since profiles may differ across regions/credentials
-    this.inferenceProfileCache.clear();
+    // Note: inferenceProfileCache is intentionally NOT cleared here.
+    // Profile-to-base-model mappings are stable across regions/credentials.
   }
 
   /**

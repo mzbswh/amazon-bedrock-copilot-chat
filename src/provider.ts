@@ -1,7 +1,6 @@
 import { ModelModality } from "@aws-sdk/client-bedrock";
 import type {
   ConverseStreamCommandInput,
-  CountTokensCommandInput,
   Message,
   SystemContentBlock,
   ToolConfiguration,
@@ -19,7 +18,7 @@ import * as vscode from "vscode";
 
 import { getRegionPrefix } from "./aws-partition";
 import { BedrockAPIClient, ListFoundationModelsDeniedError } from "./bedrock-client";
-import { convertMessages, stripThinkingContent } from "./converters/messages";
+import { convertMessages } from "./converters/messages";
 import { convertTools } from "./converters/tools";
 import { logger } from "./logger";
 import { getModelProfile, getModelTokenLimits } from "./profiles";
@@ -582,9 +581,6 @@ export class BedrockChatModelProvider implements vscode.Disposable, LanguageMode
       // Log request details
       this.logRequestDetails(requestInput);
 
-      // Validate token count
-      await this.validateTokenCount(model, requestInput, token);
-
       // Process the stream
       await this.processResponseStream(
         requestInput,
@@ -647,96 +643,13 @@ export class BedrockChatModelProvider implements vscode.Disposable, LanguageMode
   }
 
   async provideTokenCount(
-    model: LanguageModelChatInformation,
-    text: LanguageModelChatMessage | string,
-    token: CancellationToken,
+    _model: LanguageModelChatInformation,
+    _text: LanguageModelChatMessage | string,
+    _token: CancellationToken,
   ): Promise<number> {
-    // Fallback estimation function
-    const estimateTokens = (input: LanguageModelChatMessage | string): number => {
-      if (typeof input === "string") {
-        return Math.ceil(input.length / 4);
-      }
-      let totalTokens = 0;
-      for (const part of input.content) {
-        if (part instanceof vscode.LanguageModelTextPart) {
-          totalTokens += Math.ceil(part.value.length / 4);
-        }
-      }
-      return totalTokens;
-    };
-
-    try {
-      // Create AbortController for cancellation support
-      const abortController = new AbortController();
-      const cancellationListener = token.onCancellationRequested(() => {
-        abortController.abort();
-      });
-
-      // Resolve model ID for application inference profiles (ARNs) to base model ID
-      // This is needed because convertMessages calls getModelProfile which expects base model IDs
-      let baseModelId: string;
-      try {
-        baseModelId = await this.client.resolveModelId(model.id, abortController.signal);
-        logger.debug("[Bedrock Model Provider] Resolved model ID", {
-          originalModelId: model.id,
-          resolvedBaseModelId: baseModelId,
-        });
-      } catch (error) {
-        // If resolution fails, use the original model ID
-        baseModelId = model.id;
-        logger.warn("[Bedrock Model Provider] Failed to resolve model ID, using original", {
-          error: error instanceof Error ? error.message : String(error),
-          modelId: model.id,
-        });
-      }
-
-      try {
-        // For simple string input, use estimation (CountTokens API expects structured messages)
-        if (typeof text === "string") {
-          return estimateTokens(text);
-        }
-
-        // Convert the message to Bedrock format
-        const settings = await getBedrockSettings(this.globalState);
-        const converted = convertMessages([text], baseModelId, {
-          extendedThinkingEnabled: false,
-          lastThinkingBlock: undefined,
-          promptCachingEnabled: settings.promptCaching.enabled,
-        });
-
-        // Use the CountTokens API
-        const tokenCount = await this.client.countTokens(
-          model.id,
-          {
-            converse: {
-              messages: converted.messages,
-              ...(converted.system.length > 0 ? { system: converted.system } : {}),
-            },
-          },
-          abortController.signal,
-        );
-
-        // If CountTokens API is available, use its result
-        if (tokenCount !== undefined) {
-          logger.debug(`[Bedrock Model Provider] Token count from API: ${tokenCount}`);
-          return tokenCount;
-        }
-
-        // Fall back to estimation if CountTokens is not available
-        logger.debug("[Bedrock Model Provider] CountTokens not available, using estimation");
-        return estimateTokens(text);
-      } finally {
-        cancellationListener.dispose();
-      }
-    } catch (error) {
-      // If there's any error (including cancellation), fall back to estimation
-      if (error instanceof Error && error.name === "AbortError") {
-        logger.debug("[Bedrock Model Provider] Token count cancelled, using estimation");
-      } else {
-        logger.warn("[Bedrock Model Provider] Token count failed, using estimation", error);
-      }
-      return estimateTokens(text);
-    }
+    // Copilot calls provideTokenCount thousands of times during prompt building.
+    // Return 0 to skip all overhead — Copilot handles budget management internally.
+    return 0;
   }
 
   /**
@@ -1009,113 +922,6 @@ export class BedrockChatModelProvider implements vscode.Disposable, LanguageMode
       };
 
       logger.debug("[Bedrock Model Provider] 1M context enabled", { modelId });
-    }
-  }
-
-  /**
-   * Count tokens for a complete request using the CountTokens API.
-   * Falls back to estimation if the API is unavailable or fails.
-   * @param modelId The model ID to count tokens for
-   * @param input The complete input structure (messages, system, toolConfig)
-   * @param token Cancellation token
-   * @returns The number of input tokens
-   */
-  private async countRequestTokens(
-    modelId: string,
-    input: {
-      messages: Message[];
-      system?: SystemContentBlock[];
-      toolConfig?: ToolConfiguration;
-    },
-    token: CancellationToken,
-  ): Promise<number> {
-    // Fallback estimation function
-    const estimateTokens = (): number => {
-      let total = 0;
-
-      // Estimate messages tokens
-      for (const msg of input.messages) {
-        for (const content of msg.content ?? []) {
-          if ("text" in content && content.text) {
-            total += Math.ceil(content.text.length / 4);
-          }
-        }
-      }
-
-      // Estimate system tokens
-      if (input.system) {
-        for (const sys of input.system) {
-          if ("text" in sys && sys.text) {
-            total += Math.ceil(sys.text.length / 4);
-          }
-        }
-      }
-
-      // Estimate tool tokens
-      if ((input.toolConfig?.tools?.length ?? 0) > 0) {
-        try {
-          const json = JSON.stringify(input.toolConfig);
-          total += Math.ceil(json.length / 4);
-        } catch {
-          // Ignore serialization errors
-        }
-      }
-
-      return total;
-    };
-
-    try {
-      // Create AbortController for cancellation support
-      const abortController = new AbortController();
-      const cancellationListener = token.onCancellationRequested(() => {
-        abortController.abort();
-      });
-
-      try {
-        // Deep copy messages and strip thinking content for CountTokens API
-        // The CountTokens API doesn't support thinking blocks when thinking mode is not enabled,
-        // but our messages may contain thinking blocks from previous responses (injected via lastThinkingBlock)
-        const messagesForCounting = structuredClone(input.messages);
-        stripThinkingContent(messagesForCounting);
-
-        // Build the CountTokens API input
-        const countInput: CountTokensCommandInput["input"] = {
-          converse: {
-            messages: messagesForCounting,
-            ...(input.system && input.system.length > 0 ? { system: input.system } : {}),
-            ...(input.toolConfig ? { toolConfig: input.toolConfig } : {}),
-          },
-        };
-
-        // Use the CountTokens API
-        const tokenCount = await this.client.countTokens(
-          modelId,
-          countInput,
-          abortController.signal,
-        );
-
-        // If CountTokens API is available, use its result
-        if (tokenCount !== undefined) {
-          logger.debug(`[Bedrock Model Provider] Request token count from API: ${tokenCount}`);
-          return tokenCount;
-        }
-
-        // Fall back to estimation if CountTokens is not available
-        logger.debug(
-          "[Bedrock Model Provider] CountTokens not available for request, using estimation",
-        );
-        return estimateTokens();
-      } finally {
-        cancellationListener.dispose();
-      }
-    } catch (error) {
-      // If there's any error (including cancellation), fall back to estimation
-      if (error instanceof Error && error.name === "AbortError") {
-        logger.debug("[Bedrock Model Provider] Request token count cancelled, using estimation");
-      } else {
-        logger.warn("[Bedrock Model Provider] Request token count failed, using estimation", error);
-      }
-      return estimateTokens();
     }
   }
 
@@ -1506,41 +1312,6 @@ export class BedrockChatModelProvider implements vscode.Disposable, LanguageMode
     } finally {
       cancellationListener.dispose();
     }
-  }
-
-  /**
-   * Validate token count against model limits
-   */
-  private async validateTokenCount(
-    model: LanguageModelChatInformation,
-    requestInput: ConverseStreamCommandInput,
-    token: CancellationToken,
-  ): Promise<void> {
-    const inputTokenCount = await this.countRequestTokens(
-      model.id,
-      {
-        messages: requestInput.messages!,
-        system: requestInput.system,
-        toolConfig: requestInput.toolConfig,
-      },
-      token,
-    );
-
-    const tokenLimit = Math.max(1, model.maxInputTokens);
-    if (inputTokenCount > tokenLimit) {
-      logger.error("[Bedrock Model Provider] Message exceeds token limit", {
-        inputTokenCount,
-        tokenLimit,
-      });
-      throw new Error(
-        `Message exceeds token limit. Input: ${inputTokenCount} tokens, Limit: ${tokenLimit} tokens.`,
-      );
-    }
-
-    logger.debug("[Bedrock Model Provider] Token count validation passed", {
-      inputTokenCount,
-      tokenLimit,
-    });
   }
 }
 
