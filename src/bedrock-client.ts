@@ -398,13 +398,22 @@ export class BedrockAPIClient {
 
       return baseModelId;
     } catch (error) {
-      // If GetInferenceProfile fails, assume it's a regular model ID
-      // This could happen if the ID format looks like a profile but isn't, or if we don't have permissions
+      // If GetInferenceProfile fails (e.g. missing bedrock:GetInferenceProfile permission),
+      // derive the base model ID from the profile ID format instead of making an API call.
+      // e.g. "global.anthropic.claude-opus-4-6-v1" → "anthropic.claude-opus-4-6-v1"
+      //      "us.anthropic.claude-opus-4-6-v1"     → "anthropic.claude-opus-4-6-v1"
+      const parts = modelId.split(".");
+      const derivedBaseModelId =
+        parts.length > 2 && (parts[0].length <= 3 || parts[0] === "global")
+          ? parts.slice(1).join(".")
+          : modelId;
+
       logger.trace(
-        `[Bedrock API Client] GetInferenceProfile failed for ${modelId}, treating as regular model ID`,
+        `[Bedrock API Client] GetInferenceProfile failed for ${modelId}, derived base model ID: ${derivedBaseModelId}`,
         error,
       );
-      return modelId;
+      this.inferenceProfileCache.set(modelId, derivedBaseModelId);
+      return derivedBaseModelId;
     }
   }
 
